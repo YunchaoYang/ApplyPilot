@@ -37,7 +37,7 @@ console = Console()
 
 def _setup_resume() -> None:
     """Prompt for resume file and copy into APP_DIR."""
-    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt or .pdf)."))
+    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt, .tex, or .pdf)."))
 
     while True:
         path_str = Prompt.ask("Resume file path")
@@ -48,11 +48,11 @@ def _setup_resume() -> None:
             continue
 
         suffix = src.suffix.lower()
-        if suffix not in (".txt", ".pdf"):
-            console.print("[red]Unsupported format.[/red] Provide a .txt or .pdf file.")
+        if suffix not in (".txt", ".tex", ".pdf"):
+            console.print("[red]Unsupported format.[/red] Provide a .txt, .tex, or .pdf file.")
             continue
 
-        if suffix == ".txt":
+        if suffix in (".txt", ".tex"):
             shutil.copy2(src, RESUME_PATH)
             console.print(f"[green]Copied to {RESUME_PATH}[/green]")
         elif suffix == ".pdf":
