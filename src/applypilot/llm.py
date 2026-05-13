@@ -7,6 +7,8 @@ Auto-detects provider from environment:
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
+LLM_FALLBACK_MODELS (comma-separated) adds automatic model failover for
+OpenAI-compatible providers (e.g. OpenRouter).
 """
 
 import logging
@@ -86,12 +88,41 @@ class LLMClient:
 
     def __init__(self, base_url: str, model: str, api_key: str) -> None:
         self.base_url = base_url
-        self.model = model
+        fallback_models = [
+            m.strip()
+            for m in os.environ.get("LLM_FALLBACK_MODELS", "").split(",")
+            if m.strip()
+        ]
+        self.models = [model] + [m for m in fallback_models if m != model]
+        self._model_index = 0
         self.api_key = api_key
         self._client = httpx.Client(timeout=_TIMEOUT)
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+
+    @property
+    def model(self) -> str:
+        return self.models[self._model_index]
+
+    def _try_failover(self, status_code: int) -> bool:
+        """Switch to the next configured model for transient/provider errors.
+
+        Returns True if failover happened and request should be retried.
+        """
+        if status_code not in (402, 429, 503):
+            return False
+        if self._model_index >= len(self.models) - 1:
+            return False
+        previous = self.model
+        self._model_index += 1
+        log.warning(
+            "Switching LLM model due to HTTP %s: %s -> %s",
+            status_code,
+            previous,
+            self.model,
+        )
+        return True
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -228,6 +259,8 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
+                if self._try_failover(resp.status_code):
+                    continue
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
                     # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
