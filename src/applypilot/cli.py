@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import webbrowser
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -147,7 +149,8 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("haiku", "--model", "-m", help="Agent model name."),
+    agent: str = typer.Option("claude", "--agent", help="Browser agent backend: claude or codex."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -186,8 +189,38 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
+    # Check 1: runtime dependencies for auto-apply
+    import shutil
+    from applypilot.config import get_chrome_path
+
+    if agent not in ("claude", "codex"):
+        console.print("[red]Invalid --agent.[/red] Choose 'claude' or 'codex'.")
+        raise typer.Exit(code=1)
+
+    cli_bin = shutil.which(agent)
+    if not cli_bin:
+        console.print(f"[red]{agent} CLI not found on PATH.[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        get_chrome_path()
+    except FileNotFoundError:
+        console.print(
+            "[red]Chrome/Chromium not found.[/red]\n"
+            "Install Chrome or set CHROME_PATH env var."
+        )
+        raise typer.Exit(code=1)
+
+    if not shutil.which("npx"):
+        console.print(
+            "[red]Node.js (npx) not found.[/red]\n"
+            "Install Node.js 18+ for Playwright MCP."
+        )
+        raise typer.Exit(code=1)
+
+    # Keep existing tier checks for the default Claude path.
+    if agent == "claude":
+        check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -224,7 +257,7 @@ def apply(
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  {agent} --model {model} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -237,6 +270,7 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
+    console.print(f"  Agent:    {agent}")
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
@@ -253,6 +287,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        agent=agent,
     )
 
 
@@ -330,6 +365,141 @@ def dashboard() -> None:
     from applypilot.view import open_dashboard
 
     open_dashboard()
+
+
+@app.command()
+def tracker(
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write HTML to this path (default: ~/.applypilot/applications.html).",
+    ),
+    limit: int = typer.Option(1000, "--limit", "-l", help="Maximum job rows in the tracker table."),
+    min_score: Optional[int] = typer.Option(
+        None,
+        "--min-score",
+        help="Only jobs with no fit_score or fit_score >= this value.",
+    ),
+    text: bool = typer.Option(
+        False,
+        "--text",
+        "-t",
+        help="Print a compact table in the terminal instead of writing HTML.",
+    ),
+    no_open: bool = typer.Option(
+        False,
+        "--no-open",
+        help="Write HTML but do not launch a browser.",
+    ),
+) -> None:
+    """Build an application-status table (HTML or terminal) from your job database."""
+    _bootstrap()
+
+    from applypilot.database import get_application_tracker_summary, list_jobs_for_tracker
+    from applypilot.view import generate_application_tracker, tracker_pipeline_key, tracker_pipeline_label
+
+    if text:
+        from applypilot.database import get_connection
+
+        conn = get_connection()
+        sm = get_application_tracker_summary(conn)
+        cap = min(limit, 120)
+        rows = list_jobs_for_tracker(conn, limit=cap, min_score=min_score)
+
+        console.print("\n[bold]Application tracker[/bold] (summary)\n")
+        snap = Table(show_header=False, box=None, padding=(0, 2))
+        snap.add_column(style="dim")
+        snap.add_column(justify="right")
+        snap.add_row("Total in DB", str(sm["total"]))
+        snap.add_row("Applied", str(sm["applied"]))
+        snap.add_row("Failed", str(sm["failed"]))
+        snap.add_row("Applying", str(sm["applying"]))
+        snap.add_row("Ready to apply", str(sm["ready_to_apply"]))
+        snap.add_row("Scored, no tailor", str(sm["scored_no_tailor"]))
+        console.print(snap)
+
+        if not rows:
+            console.print("\n[dim]No jobs match.[/dim]\n")
+            return
+
+        tbl = Table(title=f"Recent jobs (showing {len(rows)} of up to {cap})", expand=True)
+        tbl.add_column("Stage", style="cyan", no_wrap=True)
+        tbl.add_column("Title", ratio=2, max_width=44)
+        tbl.add_column("Site", max_width=14)
+        tbl.add_column("Scr", justify="right", no_wrap=True)
+        tbl.add_column("Apply status", max_width=12)
+        tbl.add_column("Applied", style="dim", max_width=14)
+
+        for r in rows:
+            pk = tracker_pipeline_key(r)
+            stage = tracker_pipeline_label(pk)
+            title = (r.get("title") or "—").replace("\n", " ")[:42]
+            site = (r.get("site") or "—")[:12]
+            sc = "—" if r.get("fit_score") is None else str(r["fit_score"])
+            ast = (r.get("apply_status") or "—")[:10]
+            ap = (r.get("applied_at") or "—")[:12]
+            tbl.add_row(stage, title, site, sc, ast, ap)
+
+        console.print()
+        console.print(tbl)
+        console.print("\n[dim]Tip: run without --text for a filterable HTML table in your browser.[/dim]\n")
+        return
+
+    out = str(output) if output else None
+    path = generate_application_tracker(output_path=out, limit=limit, min_score=min_score)
+    if not no_open:
+        console.print("[dim]Opening in browser...[/dim]")
+        webbrowser.open(f"file:///{path}")
+
+
+@app.command()
+def ui(
+    port: int = typer.Option(8501, "--port", "-p", help="Streamlit server port."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address (use 0.0.0.0 for LAN)."),
+) -> None:
+    """Launch the Streamlit job tracker (install: pip install 'applypilot[ui]')."""
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        console.print(
+            "[red]Streamlit is not installed.[/red]\n"
+            "  pip install 'applypilot[ui]'"
+        )
+        raise typer.Exit(code=1)
+
+    import subprocess
+    import sys
+
+    import applypilot
+
+    app_path = Path(applypilot.__file__).resolve().parent / "streamlit_app.py"
+    if not app_path.is_file():
+        console.print(f"[red]Missing {app_path}[/red]")
+        raise typer.Exit(code=1)
+
+    url = f"http://{host}:{port}/"
+    console.print(f"[bold]Streamlit[/bold] → {url}")
+    console.print("[dim]Ctrl+C to stop[/dim]\n")
+
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "streamlit",
+                "run",
+                str(app_path),
+                f"--server.port={port}",
+                f"--server.address={host}",
+                "--browser.gatherUsageStats=false",
+            ],
+            check=True,
+        )
+    except KeyboardInterrupt:
+        pass
+    except subprocess.CalledProcessError as e:
+        raise typer.Exit(code=e.returncode or 1) from e
 
 
 @app.command()
