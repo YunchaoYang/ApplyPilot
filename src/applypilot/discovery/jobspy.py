@@ -74,6 +74,50 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
                 raise
 
 
+def _scrape_boards_isolated(
+    site_names: list[str],
+    *,
+    search_term: str,
+    location: str,
+    results_wanted: int,
+    hours_old: int,
+    country_indeed: str,
+    is_remote: bool,
+    proxy_config: dict | None,
+    verbose: int,
+    max_retries: int,
+    log_label: str | None,
+) -> list:
+    """Call JobSpy once per board so one site's error (e.g. ZipRecruiter 403) does not drop others."""
+    dfs: list = []
+    base: dict = {
+        "search_term": search_term,
+        "location": location,
+        "results_wanted": results_wanted,
+        "hours_old": hours_old,
+        "description_format": "markdown",
+        "country_indeed": country_indeed,
+        "verbose": verbose,
+    }
+    if is_remote:
+        base["is_remote"] = True
+    if proxy_config:
+        base["proxies"] = [proxy_config["jobspy"]]
+
+    for site in site_names:
+        kwargs = {**base, "site_name": [site]}
+        if site == "linkedin":
+            kwargs["linkedin_fetch_description"] = True
+        try:
+            dfs.append(_scrape_with_retry(kwargs, max_retries=max_retries))
+        except Exception as e:
+            if log_label:
+                log.error("[%s] (%s): %s", log_label, site, e)
+            else:
+                log.error("JobSpy (%s): %s", site, e)
+    return dfs
+
+
 # -- Location filtering ------------------------------------------------------
 
 def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
@@ -209,29 +253,22 @@ def _run_one_search(
 
     all_dfs = []
 
-    # Run non-Glassdoor sites with original location
+    # Run non-Glassdoor sites with original location (one board per call — a single 403 must not void others)
     if other_sites:
-        kwargs = {
-            "site_name": other_sites,
-            "search_term": s["query"],
-            "location": s["location"],
-            "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
-            "country_indeed": defaults.get("country_indeed", "usa"),
-            "verbose": 0,
-        }
-        if s.get("remote"):
-            kwargs["is_remote"] = True
-        if proxy_config:
-            kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
-            kwargs["linkedin_fetch_description"] = True
-        try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
-            all_dfs.append(df)
-        except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
+        site_dfs = _scrape_boards_isolated(
+            other_sites,
+            search_term=s["query"],
+            location=s["location"],
+            results_wanted=results_per_site,
+            hours_old=hours_old,
+            country_indeed=defaults.get("country_indeed", "usa"),
+            is_remote=bool(s.get("remote")),
+            proxy_config=proxy_config,
+            verbose=0,
+            max_retries=max_retries,
+            log_label=label,
+        )
+        all_dfs.extend(site_dfs)
 
     # Run Glassdoor separately with simplified location
     if has_glassdoor:
@@ -307,31 +344,58 @@ def search_jobs(
 
     log.info("Search: \"%s\" in %s | sites=%s | remote=%s", query, location, sites, remote_only)
 
-    kwargs = {
-        "site_name": sites,
-        "search_term": query,
-        "location": location,
-        "results_wanted": results_per_site,
-        "hours_old": hours_old,
-        "description_format": "markdown",
-        "country_indeed": country_indeed,
-        "verbose": 2,
-    }
+    non_gd = [si for si in sites if si != "glassdoor"]
+    has_gd = "glassdoor" in sites
+    parts: list = []
 
-    if remote_only:
-        kwargs["is_remote"] = True
+    if non_gd:
+        parts.extend(
+            _scrape_boards_isolated(
+                non_gd,
+                search_term=query,
+                location=location,
+                results_wanted=results_per_site,
+                hours_old=hours_old,
+                country_indeed=country_indeed,
+                is_remote=remote_only,
+                proxy_config=proxy_config,
+                verbose=2,
+                max_retries=2,
+                log_label=None,
+            )
+        )
 
-    if proxy_config:
-        kwargs["proxies"] = [proxy_config["jobspy"]]
+    if has_gd:
+        gd_loc = location.split(",")[0]
+        gd_kwargs = {
+            "site_name": ["glassdoor"],
+            "search_term": query,
+            "location": gd_loc,
+            "results_wanted": results_per_site,
+            "hours_old": hours_old,
+            "description_format": "markdown",
+            "country_indeed": country_indeed,
+            "verbose": 2,
+        }
+        if remote_only:
+            gd_kwargs["is_remote"] = True
+        if proxy_config:
+            gd_kwargs["proxies"] = [proxy_config["jobspy"]]
+        try:
+            parts.append(_scrape_with_retry(gd_kwargs, max_retries=2))
+        except Exception as e:
+            log.error("JobSpy (glassdoor): %s", e)
 
-    if "linkedin" in sites:
-        kwargs["linkedin_fetch_description"] = True
+    if not parts:
+        log.error("JobSpy search failed: all boards returned errors")
+        return {"error": "all job boards failed", "total": 0, "new": 0, "existing": 0}
 
-    try:
-        df = scrape_jobs(**kwargs)
-    except Exception as e:
-        log.error("JobSpy search failed: %s", e)
-        return {"error": str(e), "total": 0, "new": 0, "existing": 0}
+    import pandas as pd
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
 
     total = len(df)
     log.info("JobSpy returned %d results", total)
