@@ -6,19 +6,25 @@ Generates a self-contained HTML dashboard with:
   - Jobs-by-source breakdown
   - Filterable job cards grouped by score
   - Client-side search and score filtering
+
+Also generates ``applications.html`` — a sortable-style job application
+status table (see ``generate_application_tracker``).
 """
 
 from __future__ import annotations
 
-import os
 import webbrowser
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
-from applypilot.database import get_connection
+from applypilot.config import APP_DIR
+from applypilot.database import (
+    get_application_tracker_summary,
+    get_connection,
+    list_jobs_for_tracker,
+)
 
 console = Console()
 
@@ -404,3 +410,247 @@ def open_dashboard(output_path: str | None = None) -> None:
     path = generate_dashboard(output_path)
     console.print("[dim]Opening in browser...[/dim]")
     webbrowser.open(f"file:///{path}")
+
+
+def tracker_pipeline_key(row: dict) -> str:
+    """Stable pipeline bucket for filtering (matches tracker UI)."""
+    if row.get("applied_at"):
+        return "applied"
+    st = (row.get("apply_status") or "").strip().lower()
+    if st == "failed":
+        return "failed"
+    if st == "in_progress":
+        return "applying"
+    if st == "manual":
+        return "manual"
+    if row.get("tailored_resume_path"):
+        return "ready"
+    if row.get("fit_score") is not None:
+        return "scored"
+    if row.get("detail_scraped_at"):
+        return "enriched"
+    return "discovered"
+
+
+def tracker_pipeline_label(key: str) -> str:
+    return {
+        "applied": "Applied",
+        "failed": "Failed",
+        "applying": "Applying",
+        "manual": "Manual ATS",
+        "ready": "Ready to apply",
+        "scored": "Scored",
+        "enriched": "Enriched",
+        "discovered": "Discovered",
+    }.get(key, key)
+
+
+def _truncate(text: str | None, max_len: int) -> str:
+    if not text:
+        return ""
+    t = text.replace("\n", " ").strip()
+    return t if len(t) <= max_len else t[: max_len - 1] + "…"
+
+
+def generate_application_tracker(
+    output_path: str | None = None,
+    limit: int = 1000,
+    min_score: int | None = None,
+) -> str:
+    """Write an HTML table of jobs with application / pipeline status.
+
+    Args:
+        output_path: Destination file. Defaults to ``~/.applypilot/applications.html``.
+        limit: Maximum rows (most recently touched applications first).
+        min_score: If set, exclude jobs with ``fit_score`` below this (unscored rows still shown).
+
+    Returns:
+        Absolute path to the written HTML file.
+    """
+    out = Path(output_path) if output_path else APP_DIR / "applications.html"
+    conn = get_connection()
+    summary = get_application_tracker_summary(conn)
+    jobs = list_jobs_for_tracker(conn, limit=limit, min_score=min_score)
+
+    # Table body
+    tbody_rows = ""
+    for r in jobs:
+        key = tracker_pipeline_key(r)
+        label = tracker_pipeline_label(key)
+        title = escape(_truncate(r.get("title"), 72) or "(no title)")
+        url = escape(r.get("url") or "")
+        app_url = (r.get("application_url") or "").strip()
+        app_href = escape(app_url) if app_url else ""
+        site = escape(_truncate(r.get("site"), 24) or "—")
+        loc = escape(_truncate(r.get("location"), 36) or "—")
+        score = r.get("fit_score")
+        score_s = "—" if score is None else str(score)
+        applied = escape(_truncate(r.get("applied_at"), 22) or "—")
+        status_raw = (r.get("apply_status") or "").strip()
+        status = escape(status_raw or "—")
+        err = escape(_truncate(r.get("apply_error"), 100))
+
+        link_job = f'<a href="{url}" target="_blank" rel="noopener">listing</a>' if url else "—"
+        link_apply = (
+            f'<a href="{app_href}" target="_blank" rel="noopener">apply</a>' if app_href else "—"
+        )
+
+        badge_class = f"badge-{key}"
+        tbody_rows += f"""
+        <tr data-stage="{escape(key)}" class="row-{key}">
+          <td><span class="badge {badge_class}">{escape(label)}</span></td>
+          <td class="title-cell"><a href="{url}" target="_blank" rel="noopener">{title}</a></td>
+          <td>{site}</td>
+          <td>{loc}</td>
+          <td class="num">{escape(score_s)}</td>
+          <td>{status}</td>
+          <td class="mono">{applied}</td>
+          <td class="err-cell" title="{escape(r.get('apply_error') or '')}">{err or "—"}</td>
+          <td class="links">{link_job} · {link_apply}</td>
+        </tr>"""
+
+    sm = summary
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ApplyPilot — Application tracker</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+          background: #0f172a; color: #e2e8f0; padding: 1.5rem; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 0.25rem; }}
+  .sub {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 1.25rem; }}
+  .cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.75rem; margin-bottom: 1.25rem; }}
+  .card {{ background: #1e293b; border-radius: 10px; padding: 0.85rem; }}
+  .card b {{ display: block; font-size: 1.35rem; }}
+  .card span {{ color: #94a3b8; font-size: 0.75rem; }}
+  .toolbar {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem;
+               background: #1e293b; padding: 0.75rem 1rem; border-radius: 10px; }}
+  .toolbar label {{ color: #94a3b8; font-size: 0.8rem; margin-right: 0.35rem; }}
+  select, input[type="search"] {{
+    background: #334155; border: 1px solid #475569; color: #e2e8f0; border-radius: 6px;
+    padding: 0.35rem 0.6rem; font-size: 0.85rem; }}
+  input[type="search"] {{ min-width: 220px; flex: 1; max-width: 420px; }}
+  .wrap {{ overflow-x: auto; border-radius: 10px; border: 1px solid #334155; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; min-width: 900px; }}
+  thead {{ background: #1e293b; position: sticky; top: 0; z-index: 1; }}
+  th, td {{ padding: 0.55rem 0.65rem; text-align: left; border-bottom: 1px solid #334155; vertical-align: top; }}
+  th {{ color: #94a3b8; font-weight: 600; white-space: nowrap; }}
+  tbody tr:hover {{ background: #1e293b66; }}
+  .title-cell {{ max-width: 280px; }}
+  .title-cell a {{ color: #93c5fd; text-decoration: none; word-break: break-word; }}
+  .title-cell a:hover {{ text-decoration: underline; }}
+  .num {{ text-align: right; white-space: nowrap; }}
+  .mono {{ font-family: ui-monospace, monospace; font-size: 0.78rem; color: #cbd5e1; white-space: nowrap; }}
+  .err-cell {{ max-width: 220px; color: #fca5a5; word-break: break-word; }}
+  .links {{ white-space: nowrap; font-size: 0.78rem; }}
+  .links a {{ color: #60a5fa; }}
+  .badge {{ display: inline-block; padding: 0.15rem 0.45rem; border-radius: 6px; font-size: 0.72rem;
+            font-weight: 600; white-space: nowrap; }}
+  .badge-applied {{ background: #064e3b; color: #6ee7b7; }}
+  .badge-failed {{ background: #7f1d1d; color: #fecaca; }}
+  .badge-applying {{ background: #713f12; color: #fde68a; }}
+  .badge-manual {{ background: #4c1d95; color: #e9d5ff; }}
+  .badge-ready {{ background: #1e3a5f; color: #93c5fd; }}
+  .badge-scored {{ background: #365314; color: #d9f99d; }}
+  .badge-enriched {{ background: #134e4a; color: #99f6e4; }}
+  .badge-discovered {{ background: #374151; color: #d1d5db; }}
+  .hidden {{ display: none; }}
+  .count-line {{ color: #94a3b8; font-size: 0.85rem; margin-top: 0.5rem; }}
+</style>
+</head>
+<body>
+<h1>Application tracker</h1>
+<p class="sub">Up to {limit} jobs from your ApplyPilot database · filter by pipeline stage and search text</p>
+
+<div class="cards">
+  <div class="card"><b>{sm["total"]}</b><span>Total in DB</span></div>
+  <div class="card"><b>{sm["applied"]}</b><span>Applied</span></div>
+  <div class="card"><b>{sm["failed"]}</b><span>Failed</span></div>
+  <div class="card"><b>{sm["applying"]}</b><span>In progress</span></div>
+  <div class="card"><b>{sm["ready_to_apply"]}</b><span>Ready to apply</span></div>
+  <div class="card"><b>{sm["scored_no_tailor"]}</b><span>Scored, no tailor yet</span></div>
+</div>
+
+<div class="toolbar">
+  <div>
+    <label for="stage">Stage</label>
+    <select id="stage">
+      <option value="all">All</option>
+      <option value="applied">Applied</option>
+      <option value="failed">Failed</option>
+      <option value="applying">Applying</option>
+      <option value="manual">Manual ATS</option>
+      <option value="ready">Ready to apply</option>
+      <option value="scored">Scored</option>
+      <option value="enriched">Enriched</option>
+      <option value="discovered">Discovered</option>
+    </select>
+  </div>
+  <div style="flex:1;display:flex;align-items:center;gap:0.5rem">
+    <label for="q">Search</label>
+    <input type="search" id="q" placeholder="Title, site, location, error…">
+  </div>
+</div>
+
+<div class="wrap">
+<table>
+<thead><tr>
+  <th>Stage</th><th>Title</th><th>Site</th><th>Location</th><th>Score</th>
+  <th>Apply status</th><th>Applied at</th><th>Last error</th><th>Links</th>
+</tr></thead>
+<tbody id="tbody">
+{tbody_rows}
+</tbody>
+</table>
+</div>
+<p class="count-line" id="shown"></p>
+
+<script>
+(function() {{
+  const tbody = document.getElementById('tbody');
+  const stageEl = document.getElementById('stage');
+  const qEl = document.getElementById('q');
+  const shownEl = document.getElementById('shown');
+
+  function apply() {{
+    const st = stageEl.value;
+    const q = (qEl.value || '').toLowerCase().trim();
+    let n = 0, tot = 0;
+    tbody.querySelectorAll('tr').forEach(tr => {{
+      tot++;
+      const stageOk = (st === 'all' || tr.dataset.stage === st);
+      const textOk = !q || tr.innerText.toLowerCase().includes(q);
+      const ok = stageOk && textOk;
+      tr.classList.toggle('hidden', !ok);
+      if (ok) n++;
+    }});
+    shownEl.textContent = 'Showing ' + n + ' of ' + tot + ' rows';
+  }}
+  stageEl.addEventListener('change', apply);
+  qEl.addEventListener('input', apply);
+  apply();
+}})();
+</script>
+</body>
+</html>"""
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    path = str(out.resolve())
+    console.print(f"[green]Application tracker written to {path}[/green]")
+    return path
+
+
+def open_application_tracker(
+    output_path: str | None = None,
+    limit: int = 1000,
+    min_score: int | None = None,
+) -> str:
+    """Generate ``applications.html`` and open it in the default browser."""
+    path = generate_application_tracker(output_path, limit=limit, min_score=min_score)
+    console.print("[dim]Opening in browser...[/dim]")
+    webbrowser.open(f"file:///{path}")
+    return path
