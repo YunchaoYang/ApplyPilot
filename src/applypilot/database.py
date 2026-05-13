@@ -422,3 +422,82 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+def get_application_tracker_summary(conn: sqlite3.Connection | None = None) -> dict:
+    """Aggregate counts for the application tracker dashboard."""
+    if conn is None:
+        conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN applied_at IS NOT NULL THEN 1 ELSE 0 END) AS applied,
+            SUM(
+                CASE
+                    WHEN lower(trim(coalesce(apply_status, ''))) = 'failed'
+                         AND applied_at IS NULL
+                    THEN 1 ELSE 0
+                END
+            ) AS failed,
+            SUM(
+                CASE
+                    WHEN lower(trim(coalesce(apply_status, ''))) = 'in_progress'
+                    THEN 1 ELSE 0
+                END
+            ) AS applying,
+            SUM(
+                CASE
+                    WHEN tailored_resume_path IS NOT NULL
+                         AND applied_at IS NULL
+                         AND application_url IS NOT NULL
+                    THEN 1 ELSE 0
+                END
+            ) AS ready_to_apply,
+            SUM(
+                CASE
+                    WHEN fit_score IS NOT NULL
+                         AND tailored_resume_path IS NULL
+                    THEN 1 ELSE 0
+                END
+            ) AS scored_no_tailor
+        FROM jobs
+        """
+    ).fetchone()
+    return {k: (0 if row[k] is None else row[k]) for k in row.keys()}
+
+
+def list_jobs_for_tracker(
+    conn: sqlite3.Connection | None = None,
+    limit: int = 1000,
+    min_score: int | None = None,
+) -> list[dict]:
+    """Return job rows for application-status visualization (HTML or CLI table)."""
+    if conn is None:
+        conn = get_connection()
+
+    clauses: list[str] = ["1=1"]
+    params: list = []
+    if min_score is not None:
+        clauses.append("(fit_score IS NULL OR fit_score >= ?)")
+        params.append(min_score)
+
+    where_sql = " AND ".join(clauses)
+    sql = f"""
+        SELECT url, title, site, location, fit_score,
+               detail_scraped_at, tailored_resume_path, cover_letter_path,
+               application_url, applied_at, apply_status, apply_error,
+               apply_attempts, last_attempted_at, discovered_at
+        FROM jobs
+        WHERE {where_sql}
+        ORDER BY applied_at DESC NULLS LAST,
+                 fit_score DESC NULLS LAST,
+                 discovered_at DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    if not rows:
+        return []
+    keys = rows[0].keys()
+    return [dict(zip(keys, row)) for row in rows]
